@@ -29,6 +29,7 @@ void audio_codec_enable_input(audio_codec_t *codec, bool enable);
 void audio_codec_set_volume(audio_codec_t *codec, int volume);
 bool audio_codec_output(audio_codec_t *codec, const int16_t *data, int samples);
 bool audio_codec_input(audio_codec_t *codec, int16_t *data, int samples);
+int audio_codec_detect_voice(audio_codec_t *codec, int duration_ms);
 
 #ifdef __cplusplus
 }

@@ -116,10 +116,6 @@ static void play_mp3_task(void *arg) {
             if (esp_audio_dec_get_info(decoder, &info) == ESP_AUDIO_ERR_OK) {
                 ESP_LOGI(TAG, "MP3 信息: %dHz, %dbit, %dch, %dbps",
                          info.sample_rate, info.bits_per_sample, info.channel, info.bitrate);
-                // 如果采样率不是16000，需要通知用户
-                if (info.sample_rate != 16000) {
-                    ESP_LOGW(TAG, "注意: MP3采样率 %dHz 与I2S配置 16kHz 不匹配，可能影响音质", info.sample_rate);
-                }
             }
             header_parsed = true;
         }
@@ -136,6 +132,19 @@ static void play_mp3_task(void *arg) {
     ESP_LOGI(TAG, "MP3 播放完成");
     esp_audio_dec_close(decoder);
     free(out_buf);
+
+    // MP3播放完成后测试麦克风
+    ESP_LOGI(TAG, "--- 测试麦克风 ---");
+    audio_codec_enable_input(codec, true);
+    for (int i = 0; i < 10; i++) {
+        int level = audio_codec_detect_voice(codec, 200);
+        ESP_LOGI(TAG, "麦克风电平: %d (阈值>500为有声音)", level);
+        if (level > 500) {
+            ESP_LOGI(TAG, "✓ 检测到声音!");
+        }
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
     vTaskDelete(NULL);
 }
 
@@ -169,7 +178,7 @@ void app_main(void) {
 
     // 4. 播放 MP3
     ESP_LOGI(TAG, "[4] 播放 MP3...");
-    xTaskCreatePinnedToCore(play_mp3_task, "mp3", 8192, &g_audio_codec, 5, NULL, 1);
+    xTaskCreatePinnedToCore(play_mp3_task, "mp3", 16384, &g_audio_codec, 5, NULL, 1);
 
     // 5. 显示 JPEG
     ESP_LOGI(TAG, "[5] 显示 test.jpg...");
