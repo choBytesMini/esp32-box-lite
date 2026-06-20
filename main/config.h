@@ -1,0 +1,34 @@
+#ifndef _BOARD_CONFIG_H_
+#define _BOARD_CONFIG_H_
+
+#include "driver/gpio.h"
+
+// 音频参数
+#define AUDIO_INPUT_SAMPLE_RATE  16000
+#define AUDIO_OUTPUT_SAMPLE_RATE 16000
+
+// I2S 引脚
+#define AUDIO_I2S_GPIO_MCLK GPIO_NUM_2
+#define AUDIO_I2S_GPIO_WS   GPIO_NUM_47
+#define AUDIO_I2S_GPIO_BCLK GPIO_NUM_17
+#define AUDIO_I2S_GPIO_DIN  GPIO_NUM_16
+#define AUDIO_I2S_GPIO_DOUT GPIO_NUM_15
+
+// 音频编解码器
+#define AUDIO_CODEC_PA_PIN       GPIO_NUM_46
+#define AUDIO_CODEC_I2C_SDA_PIN  GPIO_NUM_8
+#define AUDIO_CODEC_I2C_SCL_PIN  GPIO_NUM_18
+
+// LCD 引脚 (来自 xiaozhi 官方配置)
+#define LCD_SPI_CS_PIN    GPIO_NUM_5
+#define LCD_SPI_DC_PIN    GPIO_NUM_4
+#define LCD_SPI_RST_PIN   GPIO_NUM_48  // LCD 复位 (不是 GPIO8!)
+#define LCD_SPI_MOSI_PIN  GPIO_NUM_6
+#define LCD_SPI_SCLK_PIN  GPIO_NUM_7
+#define LCD_BACKLIGHT_PIN GPIO_NUM_45
+
+// LCD 参数
+#define LCD_WIDTH   320
+#define LCD_HEIGHT  240
+
+#endif // _BOARD_CONFIG_H_
