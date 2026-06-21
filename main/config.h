@@ -2,10 +2,11 @@
 #define _BOARD_CONFIG_H_
 
 #include "driver/gpio.h"
+#include "hal/adc_types.h"
 
 // 音频参数
 #define AUDIO_INPUT_SAMPLE_RATE  16000
-#define AUDIO_OUTPUT_SAMPLE_RATE 16000
+#define AUDIO_OUTPUT_SAMPLE_RATE 44100
 
 // I2S 引脚
 #define AUDIO_I2S_GPIO_MCLK GPIO_NUM_2
@@ -19,10 +20,10 @@
 #define AUDIO_CODEC_I2C_SDA_PIN  GPIO_NUM_8
 #define AUDIO_CODEC_I2C_SCL_PIN  GPIO_NUM_18
 
-// LCD 引脚 (来自 xiaozhi 官方配置)
+// LCD 引脚
 #define LCD_SPI_CS_PIN    GPIO_NUM_5
 #define LCD_SPI_DC_PIN    GPIO_NUM_4
-#define LCD_SPI_RST_PIN   GPIO_NUM_48  // LCD 复位 (不是 GPIO8!)
+#define LCD_SPI_RST_PIN   GPIO_NUM_48
 #define LCD_SPI_MOSI_PIN  GPIO_NUM_6
 #define LCD_SPI_SCLK_PIN  GPIO_NUM_7
 #define LCD_BACKLIGHT_PIN GPIO_NUM_45
@@ -30,5 +31,32 @@
 // LCD 参数
 #define LCD_WIDTH   320
 #define LCD_HEIGHT  240
+
+// 按键 ADC 配置 (ESP32-S3-BOX-Lite 三个按键共用 ADC1 CH0 = GPIO1)
+#define BUTTON_ADC_UNIT    ADC_UNIT_1
+#define BUTTON_ADC_CHANNEL ADC_CHANNEL_0
+#define BUTTON_ADC_GPIO    GPIO_NUM_1
+
+// 按键电压阈值 (mV)
+#define BUTTON_PREV_MV_MIN   2310
+#define BUTTON_PREV_MV_MAX   2510
+#define BUTTON_ENTER_MV_MIN  1880
+#define BUTTON_ENTER_MV_MAX  2080
+#define BUTTON_NEXT_MV_MIN   720
+#define BUTTON_NEXT_MV_MAX   920
+
+// 音量控制
+#define VOLUME_DEFAULT   50
+#define VOLUME_STEP      10
+#define VOLUME_MIN       0
+#define VOLUME_MAX       100
+
+// 基准测试参数
+#define BENCHMARK_TONE_FREQ     1000
+#define BENCHMARK_TONE_DURATION 3000
+#define BENCHMARK_TONE_SR       44100
+#define BENCHMARK_MIC_DURATION  3000
+#define BENCHMARK_MIC_SR        16000
+#define BENCHMARK_VOICE_THRESH  500
 
 #endif // _BOARD_CONFIG_H_

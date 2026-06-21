@@ -26,7 +26,7 @@ bool audio_codec_init(audio_codec_t *codec, i2c_master_bus_handle_t i2c_bus,
                       gpio_num_t dout, gpio_num_t din) {
     memset(codec, 0, sizeof(audio_codec_t));
     codec->pa_pin = pa_pin;
-    codec->output_volume = 80;
+    codec->output_volume = 50;
 
     ESP_LOGI(TAG, "初始化音频编解码器...");
     ESP_LOGI(TAG, "I2S: MCLK=%d BCLK=%d WS=%d DOUT=%d DIN=%d",
@@ -135,7 +135,7 @@ bool audio_codec_init(audio_codec_t *codec, i2c_master_bus_handle_t i2c_bus,
     }
 
     // 设置音量
-    esp_codec_dev_set_out_vol(s_spk_handle, 80);
+    esp_codec_dev_set_out_vol(s_spk_handle, 50);
     esp_codec_dev_set_out_mute(s_spk_handle, false);
 
     // 创建 ES7243E ADC 接口 (麦克风)
