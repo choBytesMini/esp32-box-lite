@@ -1,191 +1,188 @@
-# ESP32-S3-BOX-Lite 智能管家终端
+# ESP32-S3-BOX-Lite 智能家居终端
 
-基于 ESP32-S3-BOX-Lite 开发板的多功能智能终端固件，集成音频播放/采集、LCD 显示和 Codec 基准测试。
+## 项目概述
 
-## 硬件平台
+基于 ESP32-S3-BOX-Lite 开发板的智能家居语音终端，支持：
+- 语音唤醒词检测（"你好小智"）
+- 录音 + Opus 编码 + WebSocket 上传到服务器
+- 服务器下发音频播放
+- LCD 聊天界面显示
+- MQTT 设备控制
 
-| 组件 | 型号 | 说明 |
-|------|------|------|
-| 主控 | ESP32-S3 | 双核 Xtensa LX7, 8MB PSRAM |
-| DAC (扬声器) | ES8156 | I2C 地址 0x10, I2S 输出 |
-| ADC (麦克风) | ES7243E | I2C 地址 0x20, I2S 输入 |
-| 功放 | NS4150 | GPIO46 控制 (HIGH=开) |
-| 显示屏 | ILI9341 | 320x240, SPI 接口 |
-| 按键 | ADC 按键 x3 | GPIO1 ADC 多路复用 |
+## 硬件架构
 
-## 引脚定义
-
-### I2S 音频
-
-| 信号 | GPIO | 说明 |
-|------|------|------|
-| MCLK | 2 | 主时钟 |
-| BCLK | 17 | 位时钟 |
-| WS | 47 | 字选择 (LRCK) |
-| DOUT | 15 | 数据输出 → ES8156 |
-| DIN | 16 | 数据输入 ← ES7243E |
-
-### I2C 控制
-
-| 信号 | GPIO | 说明 |
-|------|------|------|
-| SDA | 8 | 数据线 |
-| SCL | 18 | 时钟线 |
-
-### LCD (SPI)
-
-| 信号 | GPIO | 说明 |
-|------|------|------|
-| CS | 5 | 片选 |
-| DC | 4 | 数据/命令 |
-| RST | 48 | 复位 |
-| MOSI | 6 | 主出从入 |
-| SCLK | 7 | SPI 时钟 |
-| BL | 45 | 背光 (LOW=亮) |
-
-### 功放控制
-
-| 信号 | GPIO | 说明 |
-|------|------|------|
-| PA_EN | 46 | HIGH=开启功放 |
-
-### ADC 按键
-
-三个按键共用 ADC1_CH0 (GPIO1)，通过不同电压分压区分：
-
-| 按键 | 电压范围 (mV) | 功能 |
-|------|---------------|------|
-| 左键 (PREV) | 2310 - 2510 | 音量 -10% |
-| 中键 (ENTER) | 1880 - 2080 | 运行 Benchmark |
-| 右键 (NEXT) | 720 - 920 | 音量 +10% |
-
-## 功能模块
-
-### 1. 音频播放 (ES8156 DAC)
-
-- I2S 主模式, 44100Hz, 16-bit 立体声
-- 功放 GPIO46=HIGH 开启
-- 音量范围 0-100%, 默认 50%
-- 支持 MP3 解码播放 (esp_audio_codec)
-
-```c
-audio_codec_init(&codec, i2c_bus, PA_PIN, MCLK, BCLK, WS, DOUT, DIN);
-audio_codec_enable_output(&codec, true);
-audio_codec_set_volume(&codec, 50);
-audio_codec_output(&codec, pcm_data, samples);
+```
+┌─────────────────────────────────────────────┐
+│           ESP32-S3-BOX-Lite                  │
+│                                              │
+│  ┌──────────┐    I2S TX (STD MONO)    ┌────┐│
+│  │ ES8156   │◄────────────────────────►│    ││
+│  │ (DAC)    │    GPIO15 (DOUT)         │    ││
+│  └──────────┘                          │ E  ││
+│       ▲ I2C (0x08)                     │ S  ││
+│       │                               │ P  ││
+│  ┌────┴─────┐    I2S RX (STD STEREO)  │ 3  ││
+│  │ ES7243E  │◄────────────────────────►│ 2  ││
+│  │ (ADC)    │    GPIO16 (DIN)          │ -  ││
+│  └──────────┘                          │ S  ││
+│       ▲ I2C (0x10)                     │ 3  ││
+│       │                               └────┘│
+│  ┌──────────┐                               │
+│  │ ILI9341  │ SPI LCD (320x240)             │
+│  └──────────┘                               │
+│                                              │
+│  GPIO2=MCLK, GPIO17=BCLK, GPIO47=WS         │
+│  GPIO46=PA功放, GPIO45=LCD背光              │
+└─────────────────────────────────────────────┘
 ```
 
-### 2. 麦克风采集 (ES7243E ADC)
+## 软件架构
 
-- I2S 主模式, 16000Hz, 16-bit 立体声
-- 支持原始 PCM 录制和 RMS 电平检测
+### 模块依赖关系
 
-```c
-audio_codec_enable_input(&codec, true);
-audio_codec_input(&codec, buf, samples);         // 原始 PCM
-int rms = audio_codec_detect_voice(&codec, 200); // RMS 电平
+```
+┌─────────────────────────────────────────────┐
+│                   main.c                     │
+│  应用入口 · MQTT/WS 回调 · 按键任务 · 主循环  │
+└──────┬──────┬──────┬──────┬──────┬──────────┘
+       │      │      │      │      │
+       ▼      ▼      ▼      ▼      ▼
+┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐
+│wifi_mgr  │ │mqtt_client│ │ws_uploader│ │   audio_codec    │
+│ WiFi STA │ │ MQTT 3.1 │ │ WebSocket │ │ I2S + I2C 驱动   │
+└──────────┘ └──────────┘ └──────────┘ └───────┬──────────┘
+                                                │
+                          ┌─────────────────────┼─────────────────┐
+                          ▼                     ▼                 ▼
+                   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+                   │ audio_player │  │audio_recorder│  │wake_word_det │
+                   │ 播放:URL/PCM │  │ 录音/流式录制 │  │ AFE+WakeNet  │
+                   │ 流式队列播放 │  │ 回调上报帧   │  │ 唤醒词检测   │
+                   └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+                          │                 │                  │
+                          ▼                 ▼                  ▼
+                   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+                   │ opus_encoder │  │opus_decoder  │  │esp-sr (AFE)  │
+                   │ esp_opus_enc │  │ 原生 libopus │  │ WakeNet模型  │
+                   └──────────────┘  └──────────────┘  └──────────────┘
+                          │                 │
+                          ▼                 ▼
+                   ┌──────────────────────────────┐
+                   │     audio_stream_protocol     │
+                   │   BP3 帧格式 · Opus 常量      │
+                   └──────────────────────────────┘
 ```
 
-**语音检测阈值:**
+### 数据流
 
-| RMS 范围 | 判定 |
-|----------|------|
-| < 200 | 安静 / 无声音 |
-| 200 - 500 | 微弱声音 / 环境噪声 |
-| > 500 | 有明显声音 |
-| > 2000 | 较大声音 |
+```
+录音流程：
+  I2S RX (stereo) → audio_codec_input() → stream_task → on_audio_frame()
+    → stereo→mono 提取左声道 → Opus 编码 → BP3 帧 → WebSocket 上传
 
-### 3. Codec Benchmark
+播放流程：
+  WebSocket 接收 → on_ws_binary() → Opus 解码 → audio_player_stream_queue()
+    → stream_play_task → audio_codec_output() → I2S TX
 
-综合测试扬声器和麦克风功能，自动评估音频通路状态。
-
-```c
-benchmark_result_t result;
-codec_benchmark_run(&codec, &lcd, &result);
-codec_benchmark_print_result(&result);
+唤醒词流程：
+  I2S RX → audio_codec_input() → AFE feed → fetch → WakeNet 检测
+    → 检测到后启动录音流程
 ```
 
-**测试流程:**
+## 关键设计决策
 
-1. **环境噪声测量** - 录制 3 秒静默环境，计算 RMS 基线
-2. **扬声器播放** - 播放 1000Hz 正弦波测试音调 (3 秒)
-3. **回环采集** - 播放同时麦克风录制，检测声音回环
-4. **麦克风单独测试** - 录制 3 秒环境，验证麦克风功能
+### 1. I2S DMA 绑定 Core 1
 
-**结果结构:**
+ESP32-S3 的 I2S DMA 中断绑定在 Core 1。所有 I2S 读写任务必须在 Core 1 运行：
+- `audio_feed_task`（唤醒词音频输入）：Core 1
+- `stream_task`（流式录音）：Core 1
 
-```c
-typedef struct {
-    int  tone_rms;       // 回环 RMS 电平
-    int  silence_rms;    // 环境噪声 RMS
-    int  mic_rms;        // 麦克风单独 RMS
-    bool tone_detected;  // 回环检测通过
-    bool mic_ok;         // 麦克风正常
-    bool spk_ok;         // 扬声器正常
-} benchmark_result_t;
-```
+在 Core 0 调用 `i2s_channel_read()` 会导致 DMA 死锁。
 
-### 4. LCD 显示
+### 2. 不使用 esp_codec_dev 管理 I2S
 
-- ILI9341 驱动, 320x240, 16-bit 色彩
-- SPI 接口, 40MHz 时钟
-- 支持测试图案和 JPEG 图片显示
+`esp_codec_dev_open()` 内部的 `_i2s_data_set_fmt()` 会重新配置 I2S DMA，导致系统冻结。解决方案：
+- ES8156 (DAC) 和 ES7243E (ADC) 只通过 I2C 配置寄存器
+- I2S 数据直接用 `i2s_channel_read()` / `i2s_channel_write()` 读写
 
-```c
-lcd_init(&lcd, CS, DC, RST, MOSI, SCLK, BL);
-lcd_test_pattern(&lcd);
-lcd_display_jpeg(&lcd, jpeg_data, jpeg_size);
-```
+### 3. Feed/Fetch 双任务架构
 
-## 操作说明
+AFE 的 feed（喂数据）和 fetch（取结果）必须在不同任务中运行：
+- `audio_feed_task`：读取 I2S stereo 数据 → feed 给 AFE
+- `wake_word_wait()`：`fetch_with_delay(portMAX_DELAY)` 阻塞等待
 
-| 操作 | 说明 |
-|------|------|
-| 按左键 | 音量减小 10% |
-| 按右键 | 音量增大 10% |
-| 按中键 | 运行 Codec Benchmark 测试 |
-| 上电自动 | 播放 MP3 → 运行 Benchmark → 显示 JPEG |
+### 4. Stereo→Mono 转换
 
-## 编译与烧录
+I2S RX 配置为 STEREO（2 通道），但 Opus 编码器配置为 MONO：
+- `stream_task` 读取 `frame_samples * 2` 个 stereo 样本
+- `on_audio_frame` 提取左声道 `pcm[i*2]` 后再 Opus 编码
+
+## 编译和烧录
 
 ```bash
 # 激活 ESP-IDF 环境
-source ~/.espressif/tools/activate_idf_v6.0.1.sh
+source ~/.espressif/v6.0.1/esp-idf/export.sh
 
 # 编译
 idf.py build
 
-# 烧录
-idf.py -p /dev/cu.usbmodem101 flash
+# 烧录（需要先按 BOOT + RESET 进入下载模式）
+idf.py -p /dev/cu.usbmodem1101 flash
 
 # 监控串口
-idf.py -p /dev/cu.usbmodem101 monitor
+idf.py -p /dev/cu.usbmodem1101 monitor
 ```
 
-## 项目结构
+## 测试
 
+### 1. 唤醒词检测
+
+1. 烧录固件，等待 WiFi/WebSocket 连接
+2. 对设备说 "你好小智"
+3. 串口应显示 `Wake word detected!`
+
+### 2. 音频上传
+
+1. 唤醒词检测后，说几句话
+2. 串口应显示 `Audio frame #N: mono=960 enc=XX sent=1`
+3. 服务器日志应显示 `Received Opus frame: XX bytes`
+
+### 3. 静默超时
+
+1. 唤醒词检测后，保持安静 15 秒
+2. 串口应显示 `stt_end` 消息
+3. 系统回到等待唤醒词状态
+
+## 服务器 API
+
+- WebSocket: `ws://82.158.224.81:8888/ws`
+- HTTP: `http://82.158.224.81:5000/`
+- MQTT: `82.158.224.81:1883`
+
+### 推送音频到 ESP32
+
+```bash
+curl -X POST http://82.158.224.81:5000/api/audio/send \
+  -H "Content-Type: application/json" \
+  -d '{"path": "/opt/smart_butler/output_high.mp3"}'
 ```
-esp32_box_lite/
-├── main/
-│   ├── main.c              # 主程序, 按键控制, MP3 播放
-│   ├── audio_codec.c/h     # 音频编解码器 (ES8156 + ES7243E)
-│   ├── codec_benchmark.c/h # Codec 基准测试
-│   ├── lcd_display.c/h     # LCD 显示驱动
-│   ├── config.h            # 硬件引脚和参数配置
-│   ├── CMakeLists.txt      # 组件注册
-│   ├── idf_component.yml   # 依赖管理
-│   └── test.jpg            # 测试图片
-├── output.mp3              # 测试音频
-├── CMakeLists.txt          # 项目配置
-├── sdkconfig               # ESP-IDF 配置
-└── partitions.csv          # 分区表
-```
 
-## 依赖组件
+## 文件清单
 
-| 组件 | 版本 | 用途 |
+| 文件 | 行数 | 功能 |
 |------|------|------|
-| espressif/esp_lcd_ili9341 | ~2.0.0 | LCD 驱动 |
-| espressif/esp_codec_dev | ~1.5.6 | 音频 Codec 设备框架 |
-| espressif/esp_audio_codec | ~2.4.1 | MP3 解码器 |
-| espressif/esp_jpeg | ^1.0.0 | JPEG 解码 |
+| `config.h` | 109 | 全局配置（引脚、网络、音频参数） |
+| `main.c` | 487 | 应用入口、回调、任务 |
+| `audio_codec.c` | 158 | I2S + I2C 音频驱动 |
+| `audio_player.c` | 171 | 音频播放（URL/PCM/流式） |
+| `audio_recorder.c` | 137 | 音频录制（缓冲/流式） |
+| `wake_word_detector.c` | 130 | 唤醒词检测（AFE+WakeNet） |
+| `opus_encoder.c` | 83 | Opus 编码器 |
+| `opus_decoder.c` | 69 | Opus 解码器 |
+| `audio_stream_protocol.h` | 39 | BP3 协议定义 |
+| `websocket_uploader.c` | 169 | WebSocket 通信 |
+| `app_mqtt_client.c` | 125 | MQTT 客户端 |
+| `wifi_manager.c` | 77 | WiFi 连接管理 |
+| `lcd_display.c` | 792 | LCD 显示（聊天 UI） |
+| `http_uploader.c` | 41 | HTTP 上传 |
+| `codec_benchmark.c` | 128 | 音频硬件测试 |

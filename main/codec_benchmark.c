@@ -1,6 +1,20 @@
+/**
+ * @file codec_benchmark.c
+ * @brief 音频硬件基准测试
+ *
+ * 4 阶段测试：
+ *   1. 环境噪声测量
+ *   2. 扬声器播放测试音调
+ *   3. 扬声器播放 + 麦克风回环采集
+ *   4. 麦克风单独采集
+ *
+ * 判定标准：RMS > 500 = 有明显声音
+ */
+
 #include "codec_benchmark.h"
 #include "config.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <math.h>
@@ -8,23 +22,34 @@
 
 static const char *TAG = "Benchmark";
 
+/**
+ * @brief 生成正弦波测试音调
+ *
+ * 带淡入淡出（20ms），避免爆破音。
+ */
 static void generate_sine_tone(int16_t *buf, int samples, int freq, int sr) {
     for (int i = 0; i < samples; i++) {
         float t = (float)i / sr;
         float env = 1.0f;
-        int fade = sr / 20;
+        int fade = sr / 20;  // 20ms 淡入淡出
         if (i < fade) env = (float)i / fade;
         if (i > samples - fade) env = (float)(samples - i) / fade;
         buf[i] = (int16_t)(20000 * sinf(2.0f * M_PI * freq * t) * env);
     }
 }
 
+/** 测量麦克风 RMS 电平 */
 static int measure_mic_level(audio_codec_t *codec, int duration_ms) {
     return audio_codec_detect_voice(codec, duration_ms);
 }
 
-void codec_benchmark_run(audio_codec_t *codec, lcd_display_t *lcd,
-                         benchmark_result_t *result) {
+/**
+ * @brief 运行音频基准测试
+ *
+ * 测试流程：静默 → 播放 → 回环 → 麦克风
+ * 结果包含各阶段的 RMS 电平和通过/失败判定。
+ */
+void codec_benchmark_run(audio_codec_t *codec, benchmark_result_t *result) {
     memset(result, 0, sizeof(benchmark_result_t));
 
     ESP_LOGI(TAG, "========================================");
@@ -68,14 +93,12 @@ void codec_benchmark_run(audio_codec_t *codec, lcd_display_t *lcd,
         generate_sine_tone(tone_buf, tone_samples,
                            BENCHMARK_TONE_FREQ, BENCHMARK_TONE_SR);
 
-        // 启动麦克风采集任务
         int loop_rms = 0;
         audio_codec_enable_output(codec, true);
         audio_codec_enable_input(codec, true);
 
         // 先播放一小段让功放稳定
-        audio_codec_output(codec, tone_buf,
-                          BENCHMARK_TONE_SR / 10);  // 100ms
+        audio_codec_output(codec, tone_buf, BENCHMARK_TONE_SR / 10);  // 100ms
         vTaskDelay(pdMS_TO_TICKS(50));
 
         // 测量
@@ -110,6 +133,7 @@ void codec_benchmark_run(audio_codec_t *codec, lcd_display_t *lcd,
     codec_benchmark_print_result(result);
 }
 
+/** 打印测试结果 */
 void codec_benchmark_print_result(const benchmark_result_t *result) {
     ESP_LOGI(TAG, "--- 测试结果 ---");
     ESP_LOGI(TAG, "  环境噪声 RMS:  %d", result->silence_rms);

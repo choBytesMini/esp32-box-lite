@@ -1,16 +1,131 @@
+/**
+ * @file lcd_display.c
+ * @brief LCD 显示模块 — ILI9341 SPI LCD + 聊天 UI
+ *
+ * 功能：
+ *   - ILI9341 LCD 初始化（SPI DMA）
+ *   - 软件渲染：像素、矩形、文字（8x16 点阵字体）
+ *   - 聊天界面：气泡消息、状态栏、WiFi/MQTT 指示灯
+ *   - 后台刷新任务（Core 1, 优先级 1）
+ */
+
 #include "lcd_display.h"
 #include "config.h"
 #include "esp_log.h"
 #include "esp_lcd_ili9341.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "driver/spi_master.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "tjpgd.h"
-#include "tjpgdcnf.h"
+#include <string.h>
+#include <stdio.h>
 
-static const char *TAG = "LcdDisplay";
+static const char *TAG = "LcdChat";
 
-// ILI9341 初始化命令 (来自 xiaozhi 官方)
+// ==================== 字体数据 (8x16 ASCII) ====================
+#define FONT_W 8
+#define FONT_H 16
+
+static const uint8_t font_8x16[][16] = {
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // ' '
+    {0x00,0x00,0x18,0x3C,0x3C,0x3C,0x18,0x18,0x18,0x00,0x18,0x18,0x00,0x00,0x00,0x00}, // '!'
+    {0x00,0x66,0x66,0x66,0x24,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // '"'
+    {0x00,0x00,0x00,0x6C,0x6C,0xFE,0x6C,0x6C,0x6C,0xFE,0x6C,0x6C,0x00,0x00,0x00,0x00}, // '#'
+    {0x18,0x18,0x7C,0xC6,0xC2,0xC0,0x7C,0x06,0x06,0x86,0xC6,0x7C,0x18,0x18,0x00,0x00}, // '$'
+    {0x00,0x00,0x00,0x00,0xC2,0xC6,0x0C,0x18,0x30,0x60,0xC6,0x86,0x00,0x00,0x00,0x00}, // '%'
+    {0x00,0x00,0x38,0x6C,0x6C,0x38,0x76,0xDC,0xCC,0xCC,0xCC,0x76,0x00,0x00,0x00,0x00}, // '&'
+    {0x00,0x30,0x30,0x30,0x60,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // '''
+    {0x00,0x00,0x0C,0x18,0x30,0x30,0x30,0x30,0x30,0x30,0x18,0x0C,0x00,0x00,0x00,0x00}, // '('
+    {0x00,0x00,0x30,0x18,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x18,0x30,0x00,0x00,0x00,0x00}, // ')'
+    {0x00,0x00,0x00,0x00,0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00,0x00,0x00,0x00,0x00}, // '*'
+    {0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x7E,0x18,0x18,0x00,0x00,0x00,0x00,0x00,0x00}, // '+'
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x18,0x30,0x00,0x00,0x00}, // ','
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFE,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // '-'
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,0x00}, // '.'
+    {0x00,0x00,0x00,0x00,0x02,0x06,0x0C,0x18,0x30,0x60,0xC0,0x80,0x00,0x00,0x00,0x00}, // '/'
+    {0x00,0x00,0x7C,0xC6,0xC6,0xCE,0xDE,0xF6,0xE6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00}, // '0'
+    {0x00,0x00,0x18,0x38,0x78,0x18,0x18,0x18,0x18,0x18,0x18,0x7E,0x00,0x00,0x00,0x00}, // '1'
+    {0x00,0x00,0x7C,0xC6,0x06,0x0C,0x18,0x30,0x60,0xC0,0xC6,0xFE,0x00,0x00,0x00,0x00}, // '2'
+    {0x00,0x00,0x7C,0xC6,0x06,0x06,0x3C,0x06,0x06,0x06,0xC6,0x7C,0x00,0x00,0x00,0x00}, // '3'
+    {0x00,0x00,0x0C,0x1C,0x3C,0x6C,0xCC,0xFE,0x0C,0x0C,0x0C,0x1E,0x00,0x00,0x00,0x00}, // '4'
+    {0x00,0x00,0xFE,0xC0,0xC0,0xC0,0xFC,0x06,0x06,0x06,0xC6,0x7C,0x00,0x00,0x00,0x00}, // '5'
+    {0x00,0x00,0x38,0x60,0xC0,0xC0,0xFC,0xC6,0xC6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00}, // '6'
+    {0x00,0x00,0xFE,0xC6,0x06,0x06,0x0C,0x18,0x30,0x30,0x30,0x30,0x00,0x00,0x00,0x00}, // '7'
+    {0x00,0x00,0x7C,0xC6,0xC6,0xC6,0x7C,0xC6,0xC6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00}, // '8'
+    {0x00,0x00,0x7C,0xC6,0xC6,0xC6,0x7E,0x06,0x06,0x06,0x0C,0x78,0x00,0x00,0x00,0x00}, // '9'
+    {0x00,0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,0x00,0x00}, // ':'
+    {0x00,0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,0x18,0x18,0x30,0x00,0x00,0x00,0x00}, // ';'
+    {0x00,0x00,0x00,0x06,0x0C,0x18,0x30,0x60,0x30,0x18,0x0C,0x06,0x00,0x00,0x00,0x00}, // '<'
+    {0x00,0x00,0x00,0x00,0x00,0x7E,0x00,0x00,0x7E,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // '='
+    {0x00,0x00,0x00,0x60,0x30,0x18,0x0C,0x06,0x0C,0x18,0x30,0x60,0x00,0x00,0x00,0x00}, // '>'
+    {0x00,0x00,0x7C,0xC6,0xC6,0x0C,0x18,0x18,0x18,0x00,0x18,0x18,0x00,0x00,0x00,0x00}, // '?'
+    {0x00,0x00,0x00,0x7C,0xC6,0xC6,0xDE,0xDE,0xDE,0xDC,0xC0,0x7C,0x00,0x00,0x00,0x00}, // '@'
+    {0x00,0x00,0x10,0x38,0x6C,0xC6,0xC6,0xFE,0xC6,0xC6,0xC6,0xC6,0x00,0x00,0x00,0x00}, // 'A'
+    {0x00,0x00,0xFC,0x66,0x66,0x66,0x7C,0x66,0x66,0x66,0x66,0xFC,0x00,0x00,0x00,0x00}, // 'B'
+    {0x00,0x00,0x3C,0x66,0xC2,0xC0,0xC0,0xC0,0xC0,0xC2,0x66,0x3C,0x00,0x00,0x00,0x00}, // 'C'
+    {0x00,0x00,0xF8,0x6C,0x66,0x66,0x66,0x66,0x66,0x66,0x6C,0xF8,0x00,0x00,0x00,0x00}, // 'D'
+    {0x00,0x00,0xFE,0x66,0x62,0x68,0x78,0x68,0x60,0x62,0x66,0xFE,0x00,0x00,0x00,0x00}, // 'E'
+    {0x00,0x00,0xFE,0x66,0x62,0x68,0x78,0x68,0x60,0x60,0x60,0xF0,0x00,0x00,0x00,0x00}, // 'F'
+    {0x00,0x00,0x3C,0x66,0xC2,0xC0,0xC0,0xDE,0xC6,0xC6,0x66,0x3A,0x00,0x00,0x00,0x00}, // 'G'
+    {0x00,0x00,0xC6,0xC6,0xC6,0xC6,0xFE,0xC6,0xC6,0xC6,0xC6,0xC6,0x00,0x00,0x00,0x00}, // 'H'
+    {0x00,0x00,0x3C,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x3C,0x00,0x00,0x00,0x00}, // 'I'
+    {0x00,0x00,0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0xCC,0xCC,0xCC,0x78,0x00,0x00,0x00,0x00}, // 'J'
+    {0x00,0x00,0xE6,0x66,0x6C,0x6C,0x78,0x78,0x6C,0x66,0x66,0xE6,0x00,0x00,0x00,0x00}, // 'K'
+    {0x00,0x00,0xF0,0x60,0x60,0x60,0x60,0x60,0x60,0x62,0x66,0xFE,0x00,0x00,0x00,0x00}, // 'L'
+    {0x00,0x00,0xC6,0xEE,0xFE,0xFE,0xD6,0xC6,0xC6,0xC6,0xC6,0xC6,0x00,0x00,0x00,0x00}, // 'M'
+    {0x00,0x00,0xC6,0xE6,0xF6,0xFE,0xDE,0xCE,0xC6,0xC6,0xC6,0xC6,0x00,0x00,0x00,0x00}, // 'N'
+    {0x00,0x00,0x7C,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00}, // 'O'
+    {0x00,0x00,0xFC,0x66,0x66,0x66,0x7C,0x60,0x60,0x60,0x60,0xF0,0x00,0x00,0x00,0x00}, // 'P'
+    {0x00,0x00,0x7C,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xD6,0xDE,0x7C,0x0C,0x0E,0x00,0x00}, // 'Q'
+    {0x00,0x00,0xFC,0x66,0x66,0x66,0x7C,0x6C,0x66,0x66,0x66,0xE6,0x00,0x00,0x00,0x00}, // 'R'
+    {0x00,0x00,0x7C,0xC6,0xC6,0x60,0x38,0x0C,0x06,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00}, // 'S'
+    {0x00,0x00,0xFF,0xDB,0x99,0x18,0x18,0x18,0x18,0x18,0x18,0x3C,0x00,0x00,0x00,0x00}, // 'T'
+    {0x00,0x00,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00}, // 'U'
+    {0x00,0x00,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0x6C,0x38,0x10,0x00,0x00,0x00,0x00}, // 'V'
+    {0x00,0x00,0xC6,0xC6,0xC6,0xC6,0xC6,0xD6,0xD6,0xFE,0xEE,0xC6,0x00,0x00,0x00,0x00}, // 'W'
+    {0x00,0x00,0xC6,0xC6,0x6C,0x7C,0x38,0x38,0x7C,0x6C,0xC6,0xC6,0x00,0x00,0x00,0x00}, // 'X'
+    {0x00,0x00,0xC6,0xC6,0xC6,0x6C,0x38,0x18,0x18,0x18,0x18,0x3C,0x00,0x00,0x00,0x00}, // 'Y'
+    {0x00,0x00,0xFE,0xC6,0x86,0x0C,0x18,0x30,0x60,0xC2,0xC6,0xFE,0x00,0x00,0x00,0x00}, // 'Z'
+    {0x3C,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x3C,0x00,0x00,0x00,0x00}, // '['
+    {0x00,0x00,0x00,0x80,0xC0,0xE0,0x70,0x38,0x1C,0x0E,0x06,0x02,0x00,0x00,0x00,0x00}, // '\'
+    {0x3C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x3C,0x00,0x00,0x00,0x00}, // ']'
+    {0x00,0x10,0x38,0x6C,0xC6,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // '^'
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF,0x00,0x00,0x00}, // '_'
+    {0x00,0x30,0x18,0x0C,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // '`'
+    {0x00,0x00,0x00,0x00,0x00,0x78,0x0C,0x7C,0xCC,0xCC,0xCC,0x76,0x00,0x00,0x00,0x00}, // 'a'
+    {0x00,0x00,0xE0,0x60,0x60,0x78,0x6C,0x66,0x66,0x66,0x66,0x7C,0x00,0x00,0x00,0x00}, // 'b'
+    {0x00,0x00,0x00,0x00,0x00,0x7C,0xC6,0xC0,0xC0,0xC0,0xC6,0x7C,0x00,0x00,0x00,0x00}, // 'c'
+    {0x00,0x00,0x1C,0x0C,0x0C,0x3C,0x6C,0xCC,0xCC,0xCC,0xCC,0x76,0x00,0x00,0x00,0x00}, // 'd'
+    {0x00,0x00,0x00,0x00,0x00,0x7C,0xC6,0xFE,0xC0,0xC0,0xC6,0x7C,0x00,0x00,0x00,0x00}, // 'e'
+    {0x00,0x00,0x1C,0x36,0x32,0x30,0x78,0x30,0x30,0x30,0x30,0x78,0x00,0x00,0x00,0x00}, // 'f'
+    {0x00,0x00,0x00,0x00,0x00,0x76,0xCC,0xCC,0xCC,0xCC,0x7C,0x0C,0xCC,0x78,0x00,0x00}, // 'g'
+    {0x00,0x00,0xE0,0x60,0x60,0x6C,0x76,0x66,0x66,0x66,0x66,0xE6,0x00,0x00,0x00,0x00}, // 'h'
+    {0x00,0x00,0x18,0x18,0x00,0x38,0x18,0x18,0x18,0x18,0x18,0x3C,0x00,0x00,0x00,0x00}, // 'i'
+    {0x00,0x00,0x06,0x06,0x00,0x0E,0x06,0x06,0x06,0x06,0x06,0x06,0x66,0x3C,0x00,0x00}, // 'j'
+    {0x00,0x00,0xE0,0x60,0x60,0x66,0x6C,0x78,0x78,0x6C,0x66,0xE6,0x00,0x00,0x00,0x00}, // 'k'
+    {0x00,0x00,0x38,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x3C,0x00,0x00,0x00,0x00}, // 'l'
+    {0x00,0x00,0x00,0x00,0x00,0xEC,0xFE,0xD6,0xD6,0xD6,0xD6,0xC6,0x00,0x00,0x00,0x00}, // 'm'
+    {0x00,0x00,0x00,0x00,0x00,0xDC,0x66,0x66,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00}, // 'n'
+    {0x00,0x00,0x00,0x00,0x00,0x7C,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00}, // 'o'
+    {0x00,0x00,0x00,0x00,0x00,0xDC,0x66,0x66,0x66,0x66,0x7C,0x60,0x60,0xF0,0x00,0x00}, // 'p'
+    {0x00,0x00,0x00,0x00,0x00,0x76,0xCC,0xCC,0xCC,0xCC,0x7C,0x0C,0x0C,0x1E,0x00,0x00}, // 'q'
+    {0x00,0x00,0x00,0x00,0x00,0xDC,0x76,0x66,0x60,0x60,0x60,0xF0,0x00,0x00,0x00,0x00}, // 'r'
+    {0x00,0x00,0x00,0x00,0x00,0x7C,0xC6,0x60,0x38,0x0C,0xC6,0x7C,0x00,0x00,0x00,0x00}, // 's'
+    {0x00,0x00,0x10,0x30,0x30,0xFC,0x30,0x30,0x30,0x30,0x36,0x1C,0x00,0x00,0x00,0x00}, // 't'
+    {0x00,0x00,0x00,0x00,0x00,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0x76,0x00,0x00,0x00,0x00}, // 'u'
+    {0x00,0x00,0x00,0x00,0x00,0xC6,0xC6,0xC6,0xC6,0x6C,0x38,0x10,0x00,0x00,0x00,0x00}, // 'v'
+    {0x00,0x00,0x00,0x00,0x00,0xC6,0xC6,0xD6,0xD6,0xD6,0xFE,0x6C,0x00,0x00,0x00,0x00}, // 'w'
+    {0x00,0x00,0x00,0x00,0x00,0xC6,0x6C,0x38,0x38,0x38,0x6C,0xC6,0x00,0x00,0x00,0x00}, // 'x'
+    {0x00,0x00,0x00,0x00,0x00,0xC6,0xC6,0xC6,0xC6,0xC6,0x7E,0x06,0x0C,0xF8,0x00,0x00}, // 'y'
+    {0x00,0x00,0x00,0x00,0x00,0xFE,0xCC,0x18,0x30,0x60,0xC6,0xFE,0x00,0x00,0x00,0x00}, // 'z'
+    {0x00,0x00,0x0E,0x18,0x18,0x18,0x70,0x18,0x18,0x18,0x18,0x0E,0x00,0x00,0x00,0x00}, // '{'
+    {0x00,0x00,0x18,0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x18,0x18,0x00,0x00,0x00,0x00}, // '|'
+    {0x00,0x00,0x70,0x18,0x18,0x18,0x0E,0x18,0x18,0x18,0x18,0x70,0x00,0x00,0x00,0x00}, // '}'
+    {0x00,0x00,0x76,0xDC,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // '~'
+};
+
+// ILI9341 初始化命令
 static const ili9341_lcd_init_cmd_t vendor_specific_init[] = {
     {0xC8, (uint8_t []){0xFF, 0x93, 0x42}, 3, 0},
     {0xC0, (uint8_t []){0x0E, 0x0E}, 2, 0},
@@ -23,10 +138,149 @@ static const ili9341_lcd_init_cmd_t vendor_specific_init[] = {
     {0x36, (uint8_t []){0x08}, 1, 0},
     {0x3A, (uint8_t []){0x55}, 1, 0},
     {0xB7, (uint8_t []){0x06}, 1, 0},
-    {0x11, (uint8_t []){0}, 0x80, 0},  // Sleep out + delay
-    {0x29, (uint8_t []){0}, 0x80, 0},  // Display on + delay
-    {0, (uint8_t []){0}, 0xff, 0},     // End marker
+    {0x11, (uint8_t []){0}, 0x80, 0},
+    {0x29, (uint8_t []){0}, 0x80, 0},
+    {0, (uint8_t []){0}, 0xff, 0},
 };
+
+// ==================== 内部绘图函数 ====================
+
+// ILI9341 SPI 需要大端序，ESP32 是小端序，需要字节交换
+static inline uint16_t swap_color(uint16_t c) {
+    return (c >> 8) | (c << 8);
+}
+
+// 硬件镜像由 esp_lcd_panel_mirror 处理，这里只做字节交换
+static inline void put_pixel(lcd_display_t *lcd, int x, int y, uint16_t color) {
+    if (x >= 0 && x < LCD_WIDTH && y >= 0 && y < LCD_HEIGHT) {
+        lcd->back_buf[y * LCD_WIDTH + x] = swap_color(color);
+    }
+}
+
+// ==================== 绘图原语实现 ====================
+
+void lcd_fill_color(lcd_display_t *lcd, uint16_t color) {
+    if (!lcd->initialized) return;
+    uint16_t swapped = swap_color(color);
+    for (int i = 0; i < LCD_WIDTH * LCD_HEIGHT; i++) {
+        lcd->back_buf[i] = swapped;
+    }
+}
+
+void lcd_draw_rect(lcd_display_t *lcd, int x, int y, int w, int h, uint16_t color) {
+    lcd_draw_hline(lcd, x, y, w, color);
+    lcd_draw_hline(lcd, x, y + h - 1, w, color);
+    lcd_draw_vline(lcd, x, y, h, color);
+    lcd_draw_vline(lcd, x + w - 1, y, h, color);
+}
+
+void lcd_draw_rect_filled(lcd_display_t *lcd, int x, int y, int w, int h, uint16_t color) {
+    for (int row = y; row < y + h; row++) {
+        for (int col = x; col < x + w; col++) {
+            put_pixel(lcd, col, row, color);
+        }
+    }
+}
+
+void lcd_draw_rounded_rect(lcd_display_t *lcd, int x, int y, int w, int h, int r, uint16_t color) {
+    // 简化的圆角矩形 (用像素绘制)
+    for (int row = y; row < y + h; row++) {
+        for (int col = x; col < x + w; col++) {
+            // 检查是否在圆角区域
+            int dx, dy;
+            bool in_corner = false;
+
+            if (col < x + r && row < y + r) {
+                dx = col - (x + r);
+                dy = row - (y + r);
+                in_corner = true;
+            } else if (col >= x + w - r && row < y + r) {
+                dx = col - (x + w - r - 1);
+                dy = row - (y + r);
+                in_corner = true;
+            } else if (col < x + r && row >= y + h - r) {
+                dx = col - (x + r);
+                dy = row - (y + h - r - 1);
+                in_corner = true;
+            } else if (col >= x + w - r && row >= y + h - r) {
+                dx = col - (x + w - r - 1);
+                dy = row - (y + h - r - 1);
+                in_corner = true;
+            }
+
+            if (in_corner) {
+                if (dx * dx + dy * dy <= r * r) {
+                    put_pixel(lcd, col, row, color);
+                }
+            } else {
+                put_pixel(lcd, col, row, color);
+            }
+        }
+    }
+}
+
+void lcd_draw_pixel(lcd_display_t *lcd, int x, int y, uint16_t color) {
+    put_pixel(lcd, x, y, color);
+}
+
+void lcd_draw_hline(lcd_display_t *lcd, int x, int y, int w, uint16_t color) {
+    for (int i = 0; i < w; i++) {
+        put_pixel(lcd, x + i, y, color);
+    }
+}
+
+void lcd_draw_vline(lcd_display_t *lcd, int x, int y, int h, uint16_t color) {
+    for (int i = 0; i < h; i++) {
+        put_pixel(lcd, x, y + i, color);
+    }
+}
+
+// ==================== 文字绘制 ====================
+
+static void draw_char(lcd_display_t *lcd, int x, int y, char c, uint16_t fg, uint16_t bg) {
+    if (c < 0x20 || c > 0x7E) c = '?';
+    const uint8_t *glyph = font_8x16[c - 0x20];
+
+    for (int row = 0; row < FONT_H; row++) {
+        uint8_t bits = glyph[row];
+        for (int col = 0; col < FONT_W; col++) {
+            uint16_t color = (bits & (0x80 >> col)) ? fg : bg;
+            put_pixel(lcd, x + col, y + row, color);
+        }
+    }
+}
+
+static void draw_text(lcd_display_t *lcd, int x, int y, const char *text,
+                      int max_chars, uint16_t fg, uint16_t bg) {
+    int len = strlen(text);
+    if (len > max_chars) len = max_chars;
+    for (int i = 0; i < len; i++) {
+        draw_char(lcd, x + i * FONT_W, y, text[i], fg, bg);
+    }
+}
+
+// UTF-8 -> ASCII 转换
+static void utf8_to_ascii(const char *src, char *dst, int dst_size) {
+    int di = 0;
+    for (int si = 0; src[si] && di < dst_size - 1; si++) {
+        uint8_t c = (uint8_t)src[si];
+        if (c < 0x80) {
+            dst[di++] = c;
+        } else if ((c & 0xE0) == 0xC0) {
+            si++;
+            dst[di++] = '?';
+        } else if ((c & 0xF0) == 0xE0) {
+            si += 2;
+            dst[di++] = '?';
+        } else if ((c & 0xF8) == 0xF0) {
+            si += 3;
+            dst[di++] = '?';
+        }
+    }
+    dst[di] = '\0';
+}
+
+// ==================== 初始化 ====================
 
 bool lcd_init(lcd_display_t *lcd,
               gpio_num_t cs, gpio_num_t dc, gpio_num_t rst,
@@ -34,6 +288,26 @@ bool lcd_init(lcd_display_t *lcd,
     lcd->bl_pin = bl;
     lcd->io_handle = NULL;
     lcd->panel = NULL;
+    lcd->msg_count = 0;
+    lcd->msg_head = 0;
+    lcd->scroll_offset = 0;
+    lcd->state = CHAT_STATE_IDLE;
+    lcd->wifi_connected = false;
+    lcd->mqtt_connected = false;
+    lcd->status_text[0] = '\0';
+    lcd->dirty = false;
+
+    // 分配双缓冲 (PSRAM)
+    lcd->back_buf = heap_caps_malloc(LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    if (!lcd->back_buf) lcd->back_buf = malloc(LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t));
+    lcd->front_buf = heap_caps_malloc(LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    if (!lcd->front_buf) lcd->front_buf = malloc(LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t));
+    if (!lcd->back_buf || !lcd->front_buf) {
+        ESP_LOGE(TAG, "帧缓冲分配失败");
+        return false;
+    }
+    memset(lcd->back_buf, 0, LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t));
+    memset(lcd->front_buf, 0, LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t));
 
     ESP_LOGI(TAG, "初始化 LCD...");
 
@@ -42,8 +316,7 @@ bool lcd_init(lcd_display_t *lcd,
     bl_cfg.pin_bit_mask = (1ULL << bl);
     bl_cfg.mode = GPIO_MODE_OUTPUT;
     gpio_config(&bl_cfg);
-    gpio_set_level(bl, 0);  // LOW = 亮
-    ESP_LOGI(TAG, "背光已打开 (GPIO%d, LOW=亮)", bl);
+    gpio_set_level(bl, 0);
 
     // SPI 总线
     spi_bus_config_t bus_cfg = {};
@@ -52,9 +325,8 @@ bool lcd_init(lcd_display_t *lcd,
     bus_cfg.sclk_io_num = sclk;
     bus_cfg.quadwp_io_num = -1;
     bus_cfg.quadhd_io_num = -1;
-    bus_cfg.max_transfer_sz = 320 * 240 * 2;
+    bus_cfg.max_transfer_sz = LCD_WIDTH * LCD_HEIGHT * 2;
     ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
-    ESP_LOGI(TAG, "SPI 总线初始化完成 (SPI3_HOST)");
 
     // LCD IO
     esp_lcd_panel_io_spi_config_t io_config = {};
@@ -66,9 +338,8 @@ bool lcd_init(lcd_display_t *lcd,
     io_config.lcd_cmd_bits = 8;
     io_config.lcd_param_bits = 8;
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI3_HOST, &io_config, &lcd->io_handle));
-    ESP_LOGI(TAG, "LCD IO 初始化完成 (CS=%d, DC=%d)", cs, dc);
 
-    // ILI9341 驱动 (使用官方 vendor 配置)
+    // ILI9341 驱动
     const ili9341_vendor_config_t vendor_config = {
         .init_cmds = &vendor_specific_init[0],
         .init_cmds_size = sizeof(vendor_specific_init) / sizeof(ili9341_lcd_init_cmd_t),
@@ -81,187 +352,452 @@ bool lcd_init(lcd_display_t *lcd,
     panel_config.bits_per_pixel = 16;
     panel_config.vendor_config = (void *)&vendor_config;
     ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(lcd->io_handle, &panel_config, &lcd->panel));
-    ESP_LOGI(TAG, "ILI9341 驱动初始化完成 (RST=%d)", rst);
 
-    // 复位并初始化
     ESP_ERROR_CHECK(esp_lcd_panel_reset(lcd->panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(lcd->panel));
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(lcd->panel, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(lcd->panel, true, false));  // X轴水平镜像
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(lcd->panel, true));
 
     lcd->initialized = true;
-    ESP_LOGI(TAG, "LCD 初始化完成 (ILI9341, 320x240)");
+    ESP_LOGI(TAG, "LCD 初始化完成 (Chat UI)");
+
+    // 显示初始界面
+    lcd_refresh(lcd);
+
     return true;
 }
 
 void lcd_set_backlight(lcd_display_t *lcd, bool on) {
     if (lcd->bl_pin != GPIO_NUM_NC) {
-        gpio_set_level(lcd->bl_pin, on ? 0 : 1);  // 反转: LOW=亮
+        gpio_set_level(lcd->bl_pin, on ? 0 : 1);
     }
 }
 
-void lcd_fill_color(lcd_display_t *lcd, uint16_t color) {
-    if (!lcd->initialized || !lcd->panel) return;
+// ==================== 界面绘制 ====================
 
-    uint16_t *line = heap_caps_malloc(320 * sizeof(uint16_t), MALLOC_CAP_DMA);
-    if (!line) return;
+static void draw_header(lcd_display_t *lcd) {
+    // 头部背景
+    lcd_draw_rect_filled(lcd, 0, 0, LCD_WIDTH, HEADER_HEIGHT, COLOR_HEADER_BG);
 
-    for (int i = 0; i < 320; i++) line[i] = color;
+    // 标题
+    draw_text(lcd, 8, 6, "Smart Home Assistant", 20, COLOR_ACCENT, COLOR_HEADER_BG);
 
-    for (int y = 0; y < 240; y++) {
-        esp_lcd_panel_draw_bitmap(lcd->panel, 0, y, 320, y + 1, line);
-    }
+    // WiFi 状态指示
+    const char *wifi_icon = lcd->wifi_connected ? "WiFi" : "----";
+    uint16_t wifi_color = lcd->wifi_connected ? COLOR_GREEN : COLOR_RED;
+    draw_text(lcd, LCD_WIDTH - 100, 6, wifi_icon, 4, wifi_color, COLOR_HEADER_BG);
 
-    free(line);
+    // MQTT 状态指示
+    const char *mqtt_icon = lcd->mqtt_connected ? "MQTT" : "----";
+    uint16_t mqtt_color = lcd->mqtt_connected ? COLOR_GREEN : COLOR_RED;
+    draw_text(lcd, LCD_WIDTH - 50, 6, mqtt_icon, 4, mqtt_color, COLOR_HEADER_BG);
+
+    // 分隔线
+    lcd_draw_hline(lcd, 0, HEADER_HEIGHT - 1, LCD_WIDTH, COLOR_ACCENT);
 }
 
-void lcd_draw_rect(lcd_display_t *lcd, int x, int y, int w, int h, uint16_t color) {
-    if (!lcd->initialized || !lcd->panel) return;
+static void draw_footer(lcd_display_t *lcd) {
+    int footer_y = LCD_HEIGHT - FOOTER_HEIGHT;
 
-    uint16_t *line = heap_caps_malloc(w * sizeof(uint16_t), MALLOC_CAP_DMA);
-    if (!line) return;
+    // 底部背景
+    lcd_draw_rect_filled(lcd, 0, footer_y, LCD_WIDTH, FOOTER_HEIGHT, COLOR_STATUS_BG);
 
-    for (int i = 0; i < w; i++) line[i] = color;
+    // 分隔线
+    lcd_draw_hline(lcd, 0, footer_y, LCD_WIDTH, COLOR_ACCENT);
 
-    for (int row = y; row < y + h && row < 240; row++) {
-        esp_lcd_panel_draw_bitmap(lcd->panel, x, row, x + w, row + 1, line);
+    // 状态图标和文字
+    const char *state_icon;
+    uint16_t state_color;
+
+    switch (lcd->state) {
+        case CHAT_STATE_LISTENING:
+            state_icon = "[LISTEN]";
+            state_color = COLOR_GREEN;
+            break;
+        case CHAT_STATE_THINKING:
+            state_icon = "[THINK ]";
+            state_color = COLOR_YELLOW;
+            break;
+        case CHAT_STATE_SPEAKING:
+            state_icon = "[SPEAK ]";
+            state_color = COLOR_CYAN;
+            break;
+        case CHAT_STATE_ERROR:
+            state_icon = "[ERROR ]";
+            state_color = COLOR_RED;
+            break;
+        default:
+            state_icon = "[READY ]";
+            state_color = COLOR_GRAY;
+            break;
     }
 
-    free(line);
-}
+    draw_text(lcd, 8, footer_y + 4, state_icon, 8, state_color, COLOR_STATUS_BG);
 
-void lcd_test_pattern(lcd_display_t *lcd) {
-    if (!lcd->initialized) return;
-
-    // 彩色测试图案
-    lcd_fill_color(lcd, 0x0000);  // 黑色
-    lcd_draw_rect(lcd, 0, 0, 107, 80, 0xF800);    // 红色
-    lcd_draw_rect(lcd, 107, 0, 106, 80, 0x07E0);   // 绿色
-    lcd_draw_rect(lcd, 213, 0, 107, 80, 0x001F);   // 蓝色
-    lcd_draw_rect(lcd, 0, 80, 107, 80, 0xFFE0);    // 黄色
-    lcd_draw_rect(lcd, 107, 80, 106, 80, 0xF81F);  // 紫色
-    lcd_draw_rect(lcd, 213, 80, 107, 80, 0x07FF);  // 青色
-    lcd_draw_rect(lcd, 0, 160, 160, 80, 0xFFFF);   // 白色
-    lcd_draw_rect(lcd, 160, 160, 160, 80, 0x8410); // 灰色
-}
-
-// JPEG 解码上下文
-typedef struct {
-    const uint8_t *data;
-    size_t size;
-    size_t offset;
-    lcd_display_t *lcd;
-    int x_offset;
-    int y_offset;
-} jpeg_context_t;
-
-// 全局上下文 (用于回调)
-static jpeg_context_t *g_jpeg_ctx = NULL;
-
-// JPEG 输入回调
-static size_t jpeg_input_cb(JDEC *jdec, uint8_t *buf, size_t len) {
-    jpeg_context_t *ctx = (jpeg_context_t *)jdec->device;
-    size_t remaining = ctx->size - ctx->offset;
-    if (len > remaining) len = remaining;
-    if (buf) {
-        memcpy(buf, ctx->data + ctx->offset, len);
+    // 状态文字
+    if (lcd->status_text[0] != '\0') {
+        char ascii[32];
+        utf8_to_ascii(lcd->status_text, ascii, sizeof(ascii));
+        draw_text(lcd, 80, footer_y + 4, ascii, 28, COLOR_WHITE, COLOR_STATUS_BG);
     }
-    ctx->offset += len;
-    return len;
 }
 
-// JPEG 输出回调
-static int jpeg_output_cb(JDEC *jdec, void *bitmap, JRECT *rect) {
-    jpeg_context_t *ctx = (jpeg_context_t *)jdec->device;
-    uint16_t *pixels = (uint16_t *)bitmap;
+static void draw_chat_bubble(lcd_display_t *lcd, int y, const chat_msg_t *msg) {
+    char ascii[256];
+    utf8_to_ascii(msg->text, ascii, sizeof(ascii));
 
-    int x = rect->left + ctx->x_offset;
-    int y = rect->top + ctx->y_offset;
-    int w = rect->right - rect->left + 1;
-    int h = rect->bottom - rect->top + 1;
+    int text_len = strlen(ascii);
+    int max_chars_per_line = (BUBBLE_MAX_WIDTH - BUBBLE_PADDING * 2) / FONT_W;
 
-    // 转换字节序 (TJpgDec 输出小端序，LCD 需要大端序)
-    for (int i = 0; i < w * h; i++) {
-        uint16_t pixel = pixels[i];
-        pixels[i] = ((pixel & 0xFF) << 8) | ((pixel >> 8) & 0xFF);
-    }
-
-    for (int row = 0; row < h; row++) {
-        int draw_y = y + row;
-        if (draw_y >= 0 && draw_y < 240 && x >= 0 && x + w <= 320) {
-            esp_lcd_panel_draw_bitmap(ctx->lcd->panel, x, draw_y, x + w, draw_y + 1, pixels + row * w);
+    // 计算气泡宽度和行数
+    int lines = 1;
+    int chars_on_line = 0;
+    for (int i = 0; i < text_len; i++) {
+        if (ascii[i] == '\n' || chars_on_line >= max_chars_per_line) {
+            lines++;
+            chars_on_line = 0;
+        } else {
+            chars_on_line++;
         }
     }
-    return 1;  // Continue
+
+    int bubble_w = BUBBLE_MAX_WIDTH;
+    if (text_len < max_chars_per_line) {
+        bubble_w = text_len * FONT_W + BUBBLE_PADDING * 2;
+        if (bubble_w < BUBBLE_MIN_WIDTH) bubble_w = BUBBLE_MIN_WIDTH;
+    }
+
+    int bubble_h = lines * FONT_H + BUBBLE_PADDING * 2;
+
+    // 检查是否超出显示区域
+    if (y + bubble_h > CHAT_AREA_Y + CHAT_AREA_HEIGHT) return;
+
+    int bubble_x;
+    uint16_t bubble_color;
+    uint16_t text_color;
+
+    switch (msg->type) {
+        case MSG_TYPE_USER:
+            bubble_x = LCD_WIDTH - bubble_w - 8;
+            bubble_color = COLOR_USER_BUBBLE;
+            text_color = COLOR_WHITE;
+            break;
+        case MSG_TYPE_AI:
+            bubble_x = 8;
+            bubble_color = COLOR_AI_BUBBLE;
+            text_color = COLOR_WHITE;
+            break;
+        case MSG_TYPE_SYSTEM:
+            bubble_x = (LCD_WIDTH - bubble_w) / 2;
+            bubble_color = COLOR_DARK_GRAY;
+            text_color = COLOR_LIGHT_GRAY;
+            break;
+        case MSG_TYPE_ERROR:
+            bubble_x = (LCD_WIDTH - bubble_w) / 2;
+            bubble_color = 0x4000; // 深红
+            text_color = COLOR_RED;
+            break;
+        default:
+            return;
+    }
+
+    // 绘制气泡背景
+    lcd_draw_rounded_rect(lcd, bubble_x, y, bubble_w, bubble_h, BUBBLE_RADIUS, bubble_color);
+
+    // 绘制文字
+    int text_x = bubble_x + BUBBLE_PADDING;
+    int text_y = y + BUBBLE_PADDING;
+    int line = 0;
+    int pos = 0;
+    chars_on_line = 0;
+
+    while (pos < text_len && line < lines) {
+        if (ascii[pos] == '\n') {
+            line++;
+            chars_on_line = 0;
+            pos++;
+            continue;
+        }
+
+        int draw_x = text_x + chars_on_line * FONT_W;
+        int draw_y = text_y + line * FONT_H;
+
+        if (draw_y + FONT_H <= CHAT_AREA_Y + CHAT_AREA_HEIGHT) {
+            draw_char(lcd, draw_x, draw_y, ascii[pos], text_color, bubble_color);
+        }
+
+        chars_on_line++;
+        pos++;
+    }
 }
 
-bool lcd_display_jpeg(lcd_display_t *lcd, const uint8_t *jpeg_data, size_t jpeg_size) {
-    if (!lcd->initialized || !lcd->panel) {
-        ESP_LOGE(TAG, "LCD 未初始化");
-        return false;
+static void draw_chat_area(lcd_display_t *lcd) {
+    // 清除聊天区域
+    lcd_draw_rect_filled(lcd, 0, CHAT_AREA_Y, LCD_WIDTH, CHAT_AREA_HEIGHT, COLOR_DARK_BG);
+
+    if (lcd->msg_count == 0) {
+        // 显示欢迎信息
+        const char *welcome1 = "Welcome to Smart Home!";
+        const char *welcome2 = "Say 'Xiao Zhi' to start";
+        int x1 = (LCD_WIDTH - strlen(welcome1) * FONT_W) / 2;
+        int x2 = (LCD_WIDTH - strlen(welcome2) * FONT_W) / 2;
+        draw_text(lcd, x1, CHAT_AREA_Y + 60, welcome1, 24, COLOR_GRAY, COLOR_DARK_BG);
+        draw_text(lcd, x2, CHAT_AREA_Y + 80, welcome2, 26, COLOR_GRAY, COLOR_DARK_BG);
+        return;
     }
 
-    ESP_LOGI(TAG, "开始解码 JPEG (%d bytes)...", jpeg_size);
+    // 计算可见消息范围
+    int visible_height = CHAT_AREA_HEIGHT - MSG_SPACING;
+    int total_msgs = lcd->msg_count;
+    int end_idx = (lcd->msg_head - lcd->scroll_offset + MAX_CHAT_MESSAGES) % MAX_CHAT_MESSAGES;
 
-    // 创建上下文
-    jpeg_context_t ctx = {
-        .data = jpeg_data,
-        .size = jpeg_size,
-        .offset = 0,
-        .lcd = lcd,
-        .x_offset = 0,
-        .y_offset = 0
-    };
-    g_jpeg_ctx = &ctx;
+    // 从下往上计算需要显示的消息
+    int used_height = 0;
+    int msg_heights[MAX_CHAT_MESSAGES];
+    int msg_indices[MAX_CHAT_MESSAGES];
+    int visible_count = 0;
 
-    // 分配工作缓冲区 (TJpgDec 需要至少 3100 字节，大图片需要更多)
-    void *work_buf = heap_caps_malloc(8192, MALLOC_CAP_DMA);
-    if (!work_buf) {
-        ESP_LOGE(TAG, "工作缓冲区分配失败");
-        return false;
-    }
-    ESP_LOGI(TAG, "工作缓冲区已分配 (8192 bytes)");
+    for (int i = 0; i < total_msgs && i < MAX_CHAT_MESSAGES; i++) {
+        int idx = (end_idx - i + MAX_CHAT_MESSAGES) % MAX_CHAT_MESSAGES;
+        const chat_msg_t *msg = &lcd->messages[idx];
 
-    // 初始化 JPEG 解码器
-    JDEC jdec;
-    memset(&jdec, 0, sizeof(jdec));
-    jdec.device = &ctx;
+        char ascii[256];
+        utf8_to_ascii(msg->text, ascii, sizeof(ascii));
+        int text_len = strlen(ascii);
+        int max_chars_per_line = (BUBBLE_MAX_WIDTH - BUBBLE_PADDING * 2) / FONT_W;
 
-    JRESULT res = jd_prepare(&jdec, jpeg_input_cb, work_buf, 8192, &ctx);
-    if (res != JDR_OK) {
-        ESP_LOGE(TAG, "JPEG 准备失败: %d", res);
-        free(work_buf);
-        return false;
-    }
+        int lines = 1;
+        int chars = 0;
+        for (int j = 0; j < text_len; j++) {
+            if (ascii[j] == '\n' || chars >= max_chars_per_line) {
+                lines++;
+                chars = 0;
+            } else {
+                chars++;
+            }
+        }
 
-    ESP_LOGI(TAG, "JPEG 图像: %dx%d", jdec.width, jdec.height);
+        int h = lines * FONT_H + BUBBLE_PADDING * 2 + MSG_SPACING;
+        if (used_height + h > visible_height) break;
 
-    // 计算居中位置
-    ctx.x_offset = (320 - (int)jdec.width) / 2;
-    ctx.y_offset = (240 - (int)jdec.height) / 2;
-    if (ctx.x_offset < 0) ctx.x_offset = 0;
-    if (ctx.y_offset < 0) ctx.y_offset = 0;
-
-    ESP_LOGI(TAG, "显示位置: (%d, %d)", ctx.x_offset, ctx.y_offset);
-
-    // 重置偏移量
-    ctx.offset = 0;
-    jdec.device = &ctx;
-
-    // 清屏
-    lcd_fill_color(lcd, 0x0000);
-
-    // 解码并显示
-    ESP_LOGI(TAG, "开始解码...");
-    res = jd_decomp(&jdec, jpeg_output_cb, 0);
-    if (res != JDR_OK) {
-        ESP_LOGE(TAG, "JPEG 解码失败: %d", res);
-        free(work_buf);
-        return false;
+        msg_heights[visible_count] = h;
+        msg_indices[visible_count] = idx;
+        visible_count++;
+        used_height += h;
     }
 
-    free(work_buf);
-    g_jpeg_ctx = NULL;
-    ESP_LOGI(TAG, "JPEG 显示完成");
-    return true;
+    // 从上往下绘制消息
+    int y = CHAT_AREA_Y + MSG_SPACING;
+    for (int i = visible_count - 1; i >= 0; i--) {
+        draw_chat_bubble(lcd, y, &lcd->messages[msg_indices[i]]);
+        y += msg_heights[i];
+    }
+
+    // 滚动指示器
+    if (lcd->scroll_offset > 0) {
+        draw_text(lcd, LCD_WIDTH - 20, CHAT_AREA_Y + 2, "^", 1, COLOR_ACCENT, COLOR_DARK_BG);
+    }
+}
+
+// ==================== 公共 API ====================
+
+void lcd_chat_add_message(lcd_display_t *lcd, msg_type_t type, const char *text) {
+    if (!lcd->initialized) return;
+
+    int idx = lcd->msg_head;
+    lcd->messages[idx].type = type;
+    strncpy(lcd->messages[idx].text, text, sizeof(lcd->messages[idx].text) - 1);
+    lcd->messages[idx].text[sizeof(lcd->messages[idx].text) - 1] = '\0';
+
+    lcd->msg_head = (lcd->msg_head + 1) % MAX_CHAT_MESSAGES;
+    if (lcd->msg_count < MAX_CHAT_MESSAGES) {
+        lcd->msg_count++;
+    }
+
+    // 自动滚动到底部
+    lcd->scroll_offset = 0;
+
+    ESP_LOGD(TAG, "add_message: type=%d, dirty=true", type);
+    lcd->dirty = true;
+}
+
+void lcd_chat_set_state(lcd_display_t *lcd, chat_state_t state, const char *detail) {
+    lcd->state = state;
+    if (detail) {
+        strncpy(lcd->status_text, detail, sizeof(lcd->status_text) - 1);
+        lcd->status_text[sizeof(lcd->status_text) - 1] = '\0';
+    } else {
+        lcd->status_text[0] = '\0';
+    }
+    ESP_LOGD(TAG, "set_state: state=%d, dirty=true", state);
+    lcd->dirty = true;
+}
+
+void lcd_set_wifi_status(lcd_display_t *lcd, bool connected) {
+    lcd->wifi_connected = connected;
+    lcd->dirty = true;
+}
+
+void lcd_set_mqtt_status(lcd_display_t *lcd, bool connected) {
+    lcd->mqtt_connected = connected;
+    lcd->dirty = true;
+}
+
+void lcd_chat_scroll_up(lcd_display_t *lcd) {
+    if (lcd->scroll_offset < lcd->msg_count - 1) {
+        lcd->scroll_offset++;
+        lcd->dirty = true;
+    }
+}
+
+void lcd_chat_scroll_down(lcd_display_t *lcd) {
+    if (lcd->scroll_offset > 0) {
+        lcd->scroll_offset--;
+        lcd->dirty = true;
+    }
+}
+
+void lcd_chat_scroll_to_bottom(lcd_display_t *lcd) {
+    lcd->scroll_offset = 0;
+    lcd->dirty = true;
+}
+
+void lcd_chat_clear(lcd_display_t *lcd) {
+    lcd->msg_count = 0;
+    lcd->msg_head = 0;
+    lcd->scroll_offset = 0;
+    lcd->dirty = true;
+}
+
+void lcd_refresh(lcd_display_t *lcd) {
+    if (!lcd->initialized) return;
+
+    int64_t t0 = esp_timer_get_time();
+
+    // 渲染到 back_buf
+    draw_header(lcd);
+    draw_chat_area(lcd);
+    draw_footer(lcd);
+
+    int64_t t1 = esp_timer_get_time();
+
+    // 交换前后缓冲
+    uint16_t *tmp = lcd->back_buf;
+    lcd->back_buf = lcd->front_buf;
+    lcd->front_buf = tmp;
+
+    // 用DMA缓冲区发送 front_buf (静态分配，避免每次刷新都申请)
+    static uint16_t *s_dma_buf = NULL;
+    const int batch_lines = 20;
+    const int batch_bytes = LCD_WIDTH * batch_lines * sizeof(uint16_t);
+    if (!s_dma_buf) {
+        s_dma_buf = heap_caps_malloc(batch_bytes, MALLOC_CAP_DMA);
+    }
+    if (!s_dma_buf) {
+        ESP_LOGE(TAG, "DMA buf alloc failed!");
+        return;
+    }
+
+    for (int y = 0; y < LCD_HEIGHT; y += batch_lines) {
+        int h = (y + batch_lines <= LCD_HEIGHT) ? batch_lines : (LCD_HEIGHT - y);
+        memcpy(s_dma_buf, &lcd->front_buf[y * LCD_WIDTH], h * LCD_WIDTH * sizeof(uint16_t));
+        esp_lcd_panel_draw_bitmap(lcd->panel, 0, y, LCD_WIDTH, y + h, s_dma_buf);
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    int64_t t2 = esp_timer_get_time();
+    ESP_LOGI(TAG, "Refresh: render=%lldms, send=%lldms, total=%lldms",
+             (t1 - t0) / 1000, (t2 - t1) / 1000, (t2 - t0) / 1000);
+}
+
+// 后台刷新任务
+static void lcd_refresh_task(void *arg) {
+    lcd_display_t *lcd = (lcd_display_t *)arg;
+    vTaskDelay(pdMS_TO_TICKS(500));
+    ESP_LOGI(TAG, "Refresh task started on core %d", xPortGetCoreID());
+    while (1) {
+        if (lcd->dirty) {
+            lcd->dirty = false;
+            ESP_LOGI(TAG, "Dirty flag detected, refreshing...");
+            lcd_refresh(lcd);
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+void lcd_start_refresh_task(lcd_display_t *lcd) {
+    xTaskCreatePinnedToCore(lcd_refresh_task, "lcd_ref", 4096, lcd, 1, NULL, 1);
+}
+
+// ==================== 兼容旧接口 ====================
+
+void lcd_show_ready(lcd_display_t *lcd) {
+    lcd_chat_set_state(lcd, CHAT_STATE_IDLE, "Ready");
+    lcd_chat_add_message(lcd, MSG_TYPE_SYSTEM, "System ready. Say wake word to start.");
+}
+
+void lcd_show_status(lcd_display_t *lcd, const char *status) {
+    char ascii[64];
+    utf8_to_ascii(status, ascii, sizeof(ascii));
+    lcd_chat_set_state(lcd, CHAT_STATE_IDLE, ascii);
+}
+
+void lcd_show_reply(lcd_display_t *lcd, const char *user, const char *text) {
+    char buf[320];
+    char ascii_user[32];
+    utf8_to_ascii(user, ascii_user, sizeof(ascii_user));
+    snprintf(buf, sizeof(buf), "[%s]: %s", ascii_user, text);
+    lcd_chat_add_message(lcd, MSG_TYPE_AI, buf);
+}
+
+void lcd_show_identity(lcd_display_t *lcd, const char *user, float confidence) {
+    char buf[128];
+    char ascii[32];
+    utf8_to_ascii(user, ascii, sizeof(ascii));
+    snprintf(buf, sizeof(buf), "Identified: %s (%.0f%%)", ascii, confidence * 100);
+    lcd_chat_add_message(lcd, MSG_TYPE_SYSTEM, buf);
+}
+
+void lcd_show_alert(lcd_display_t *lcd, const char *msg) {
+    char buf[128];
+    char ascii[64];
+    utf8_to_ascii(msg, ascii, sizeof(ascii));
+    snprintf(buf, sizeof(buf), "ALERT: %s", ascii);
+    lcd_chat_add_message(lcd, MSG_TYPE_ERROR, buf);
+}
+
+void lcd_show_error(lcd_display_t *lcd, const char *msg) {
+    char buf[128];
+    char ascii[64];
+    utf8_to_ascii(msg, ascii, sizeof(ascii));
+    snprintf(buf, sizeof(buf), "Error: %s", ascii);
+    lcd_chat_add_message(lcd, MSG_TYPE_ERROR, buf);
+}
+
+void lcd_show_now_playing(lcd_display_t *lcd, const char *track, const char *artist, const char *state) {
+    char buf[200];
+    char ascii_track[64], ascii_artist[64], ascii_state[32];
+    utf8_to_ascii(track, ascii_track, sizeof(ascii_track));
+    utf8_to_ascii(artist, ascii_artist, sizeof(ascii_artist));
+    utf8_to_ascii(state, ascii_state, sizeof(ascii_state));
+    snprintf(buf, sizeof(buf), "Music [%s]: %s - %s", ascii_state, ascii_artist, ascii_track);
+    lcd_chat_add_message(lcd, MSG_TYPE_SYSTEM, buf);
+}
+
+void lcd_show_music_error(lcd_display_t *lcd, const char *msg) {
+    char buf[128];
+    char ascii[64];
+    utf8_to_ascii(msg, ascii, sizeof(ascii));
+    snprintf(buf, sizeof(buf), "Music Error: %s", ascii);
+    lcd_chat_add_message(lcd, MSG_TYPE_ERROR, buf);
+}
+
+void lcd_show_skill(lcd_display_t *lcd, const char *user, const char *skill_name) {
+    char buf[160];
+    char ascii_user[32], ascii_skill[64];
+    utf8_to_ascii(user, ascii_user, sizeof(ascii_user));
+    utf8_to_ascii(skill_name, ascii_skill, sizeof(ascii_skill));
+    snprintf(buf, sizeof(buf), "%s switched to: %s", ascii_user, ascii_skill);
+    lcd_chat_add_message(lcd, MSG_TYPE_SYSTEM, buf);
 }

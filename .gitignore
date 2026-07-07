@@ -2,9 +2,8 @@ build/
 managed_components/
 dependencies.lock
 sdkconfig.old
-sdkconfig 2.old
-sdkconfig 3.old
-sdkconfig 4.old
+sdkconfig*.old
 .vscode/
 *.pyc
 __pycache__/
+compile_commands.json
