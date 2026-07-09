@@ -314,7 +314,7 @@ static void on_audio_frame(const int16_t *pcm, int samples, void *user_ctx) {
  *
  * 完整流程：
  *   1. 等待 WebSocket 连接
- *   2. 调用 wake_word_wait() 阻塞等待唤醒词（"你好小智"）
+ *   2. 调用 wake_word_wait() 阻塞等待唤醒词（"你好小安"）
  *   3. 检测到后启动流式录音（stream_task）
  *   4. 持续监控语音活动，15 秒无语音自动停止
  *   5. 发送 stt_end 信号，等待服务器回复
